@@ -6,8 +6,8 @@ import pandas as pd
 from supabase import create_client, Client
 
 # --- CONFIGURATION ---
-# Try these variations if the first doesn't work: "Trivago Hotels", "trivago_hotels", "trivago hotels"
-TARGET_TABLE_NAME = "Trivago Hotels" 
+# IMPORTANT: Since your table name has a space, we keep it as is.
+TABLE_NAME = "trivago_hotels"  
 BATCH_SIZE = 1000
 
 # Setup Connection
@@ -17,52 +17,43 @@ awin_url: str = os.environ.get("AWIN_FEED_URL")
 supabase: Client = create_client(url, key)
 
 def sync_data():
-    print("--- STEP 1: CHECKING TABLE NAME ---")
-    # This is a 'hack' to force an error if the table name is wrong
-    try:
-        # Try to read 1 row just to see if the table exists
-        supabase.table(TARGET_TABLE_NAME).select("id").limit(1).execute()
-        print(f"SUCCESS: Table '{TARGET_TABLE_NAME}' found!")
-    except Exception as e:
-        print(f"CRITICAL ERROR: Table '{TARGET_TABLE_NAME}' does not exist in Supabase.")
-        print("Detailed Error:", e)
-        print("TIP: Check your Supabase Dashboard. Is the table name actually 'trivago_hotels' (all lowercase)?")
-        # Stop the script immediately so you see a RED X
-        exit(1) 
-
-    print("\n--- STEP 2: DOWNLOADING DATA ---")
+    print("1. Downloading AWIN feed...")
     response = requests.get(awin_url)
+    
     if response.status_code != 200:
         print(f"Error: Download failed with code {response.status_code}")
-        exit(1)
+        return
 
-    print("--- STEP 3: PROCESSING & UPLOADING ---")
+    print("2. Processing GZIP file...")
     try:
         with io.BytesIO(response.content) as compressed_file:
             with gzip.open(compressed_file, 'rt', encoding='utf-8', errors='ignore') as f:
                 
+                # Read CSV
+                # We read as strings (dtype=str) to prevent data loss (like leading zeros)
                 for chunk in pd.read_csv(f, chunksize=BATCH_SIZE, dtype=str):
                     
-                    # Map ID column
+                    # --- CRITICAL STEP: MAP ID ---
+                    # We copy 'aw_product_id' into 'id' so Supabase knows which row is which.
                     if 'aw_product_id' in chunk.columns:
                         chunk['id'] = chunk['aw_product_id']
                     
-                    # Clean data
+                    # Clean data: Replace NaN (empty) with None (NULL for SQL)
                     chunk = chunk.where(pd.notnull(chunk), None)
+                    
+                    # Convert to dictionary
                     data = chunk.to_dict(orient='records')
                     
-                    # UPSERT - NO TRY/EXCEPT BLOCK
-                    # If this fails, the script will crash and tell us exactly why
-                    print(f"Attempting to upload batch of {len(data)} rows...")
-                    supabase.table(TARGET_TABLE_NAME).upsert(data, on_conflict='id').execute()
-                    print("   Success!")
+                    try:
+                        # Upsert to Supabase
+                        # on_conflict='id' uses the ID we just mapped to update existing rows
+                        supabase.table(TABLE_NAME).upsert(data, on_conflict='id').execute()
+                        print(f"   Synced batch of {len(data)} rows.")
+                    except Exception as e:
+                        print(f"   Error syncing batch: {e}")
 
     except Exception as e:
-        print("\n!!!!!!!! UPLOAD FAILED !!!!!!!!")
-        print("Here is exactly why Supabase rejected the data:")
-        print(e)
-        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        exit(1)
+        print(f"CRITICAL ERROR: {e}")
 
 if __name__ == "__main__":
     sync_data()
