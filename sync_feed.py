@@ -1,6 +1,6 @@
 import os
 import requests
-import zipfile
+import gzip
 import io
 import pandas as pd
 from supabase import create_client, Client
@@ -11,43 +11,42 @@ key: str = os.environ.get("SUPABASE_KEY")
 awin_url: str = os.environ.get("AWIN_FEED_URL")
 supabase: Client = create_client(url, key)
 
-TABLE_NAME = "Trivago Hotels" # <--- REPLACE THIS WITH YOUR TABLE NAME
-BATCH_SIZE = 1000 # Upsert in batches to prevent timeouts
+TABLE_NAME = "Trivago Hotels" # <--- IMPORTANT: CHANGE THIS TO YOUR TABLE NAME
+BATCH_SIZE = 1000
 
 def sync_data():
     print("1. Downloading AWIN feed...")
     response = requests.get(awin_url)
-    response.raise_for_status()
+    
+    if response.status_code != 200:
+        print(f"Error: Download failed with status code {response.status_code}")
+        return
 
-    # 2. Unzip in memory
-    print("2. Unzipping...")
-    with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-        # Assume the first file in the zip is the data feed
-        csv_filename = z.namelist()[0]
-        print(f"   Found file: {csv_filename}")
-        
-        with z.open(csv_filename) as f:
-            # 3. Process CSV in chunks using Pandas
-            print("3. Processing and Syncing...")
-            
-            # Adjust 'sep' if your CSV uses semicolons or tabs
-            # dtype=str ensures phone numbers/IDs don't lose leading zeros
-            for chunk in pd.read_csv(f, chunksize=BATCH_SIZE, dtype=str):
+    print("2. Decompressing GZIP file...")
+    try:
+        # Wrap the downloaded content in a BytesIO buffer
+        with io.BytesIO(response.content) as compressed_file:
+            # Open it as a Gzip file in text mode ('rt')
+            with gzip.open(compressed_file, 'rt', encoding='utf-8', errors='ignore') as f:
                 
-                # Clean data: Replace NaN with None (NULL in SQL)
-                chunk = chunk.where(pd.notnull(chunk), None)
-                
-                # Convert to list of dicts
-                data = chunk.to_dict(orient='records')
-                
-                try:
-                    # 4. Upsert to Supabase
-                    # on_conflict='id' ensures we update existing rows instead of failing
-                    # Replace 'id' with your table's Primary Key column name
-                    supabase.table(TABLE_NAME).upsert(data, on_conflict='id').execute()
-                    print(f"   Synced batch of {len(data)} rows.")
-                except Exception as e:
-                    print(f"   Error syncing batch: {e}")
+                print("3. Processing and Syncing...")
+                # Read the CSV directly from the decompressed stream
+                for chunk in pd.read_csv(f, chunksize=BATCH_SIZE, dtype=str):
+                    
+                    # Clean data: Replace NaN with None
+                    chunk = chunk.where(pd.notnull(chunk), None)
+                    data = chunk.to_dict(orient='records')
+                    
+                    try:
+                        # Upsert to Supabase
+                        # Ensure 'id' matches your table's primary key
+                        supabase.table(TABLE_NAME).upsert(data, on_conflict='id').execute()
+                        print(f"   Synced batch of {len(data)} rows.")
+                    except Exception as e:
+                        print(f"   Error syncing batch: {e}")
+
+    except Exception as e:
+        print(f"CRITICAL ERROR: Could not process the file. Details: {e}")
 
 if __name__ == "__main__":
     sync_data()
