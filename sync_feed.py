@@ -43,10 +43,25 @@ def clean_numeric_column(df, col_name):
 def sync_data():
     print(f"--- STARTING SYNC FOR: {TARGET_TABLE_NAME} ---")
     
-    # 1. Capture the start time of this specific run
-    # We will use this to identify which rows were NOT updated later.
+    # 1. Capture the start time
     sync_start_time = datetime.now(timezone.utc).isoformat()
     print(f"Timestamp for this run: {sync_start_time}")
+
+    # --- NEW STEP: WIPE EXISTING DATA ---
+    print("1.5. Wiping existing table data (Fresh Start)...")
+    try:
+        # Supabase (PostgREST) requires a filter to allow deletion.
+        # We use .neq("id", -1) to select effectively "all rows" 
+        # (Assuming your IDs are positive numbers).
+        # If your IDs are UUIDs/Strings, use .neq("id", "placeholder") instead.
+        supabase.table(TARGET_TABLE_NAME).delete().neq("id", -1).execute()
+        print("   Table wiped successfully.")
+    except Exception as e:
+        print(f"   !!! CRITICAL ERROR WIPING TABLE: {e}")
+        # We exit here because if we can't wipe, we might duplicate data 
+        # or violate the logic of a 'fresh sync'.
+        exit(1)
+    # ------------------------------------
 
     print("2. Downloading Data...")
     response = requests.get(awin_url)
@@ -79,31 +94,12 @@ def sync_data():
                     # D. UPLOAD
                     data = chunk.to_dict(orient='records')
                     
-                    print(f"   Upserting batch of {len(data)} rows...")
+                    print(f"   Inserting batch of {len(data)} rows...")
                     try:
-                        # Upsert data. This updates existing rows with the new price 
-                        # AND the new 'last_synced_at' timestamp.
+                        # We use upsert here, which acts as an insert since the table is empty.
                         supabase.table(TARGET_TABLE_NAME).upsert(data, on_conflict='id').execute()
                     except Exception as e:
                         print(f"   !!! BATCH ERROR: {e}")
-
-        # 4. CLEANUP: Delete Old Data
-        print("4. Removing expired deals (Ghost Data)...")
-        
-        # Logic: If 'last_synced_at' is NOT equal to our current 'sync_start_time',
-        # it means the hotel was not in the file we just processed. Delete it.
-        try:
-            response = supabase.table(TARGET_TABLE_NAME)\
-                .delete()\
-                .neq("last_synced_at", sync_start_time)\
-                .execute()
-            
-            # Note: Depending on your Supabase version/client, the response might vary,
-            # but the .neq() filter is the key here.
-            print("   Expired deals deleted successfully.")
-            
-        except Exception as e:
-            print(f"   !!! CLEANUP ERROR: {e}")
 
     except Exception as e:
         print(f"CRITICAL ERROR: {e}")
