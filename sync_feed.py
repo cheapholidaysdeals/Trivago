@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from supabase import create_client, Client
 
 # --- CONFIGURATION ---
-TARGET_TABLE_NAME = "Trivago Hotels" 
+TARGET_TABLE_NAME = "Trivago Hotels"
 BATCH_SIZE = 1000
 
 # LIST OF COLUMNS THAT MUST BE NUMBERS
@@ -47,19 +47,15 @@ def sync_data():
     sync_start_time = datetime.now(timezone.utc).isoformat()
     print(f"Timestamp for this run: {sync_start_time}")
 
-    # --- NEW STEP: WIPE EXISTING DATA ---
-    print("1.5. Wiping existing table data (Fresh Start)...")
+    # --- NEW STEP: RPC TRUNCATE ---
+    print("1.5. Wiping table via SQL Function (Instant)...")
     try:
-        # Supabase (PostgREST) requires a filter to allow deletion.
-        # We use .neq("id", -1) to select effectively "all rows" 
-        # (Assuming your IDs are positive numbers).
-        # If your IDs are UUIDs/Strings, use .neq("id", "placeholder") instead.
-        supabase.table(TARGET_TABLE_NAME).delete().neq("id", -1).execute()
-        print("   Table wiped successfully.")
+        # This calls the SQL function we created in Step 1
+        supabase.rpc("truncate_trivago_hotels").execute()
+        print("   Table truncated successfully.")
     except Exception as e:
         print(f"   !!! CRITICAL ERROR WIPING TABLE: {e}")
-        # We exit here because if we can't wipe, we might duplicate data 
-        # or violate the logic of a 'fresh sync'.
+        print("   Make sure you created the 'truncate_trivago_hotels' function in Supabase SQL Editor.")
         exit(1)
     # ------------------------------------
 
@@ -81,7 +77,7 @@ def sync_data():
                     if 'aw_product_id' in chunk.columns:
                         chunk['id'] = chunk['aw_product_id']
                     
-                    # Add the 'last_synced_at' column with current time
+                    # Add the 'last_synced_at' column
                     chunk['last_synced_at'] = sync_start_time
                     
                     # B. CLEAN NUMERIC COLUMNS
@@ -96,7 +92,7 @@ def sync_data():
                     
                     print(f"   Inserting batch of {len(data)} rows...")
                     try:
-                        # We use upsert here, which acts as an insert since the table is empty.
+                        # Since table is empty, we can just insert (upsert handles conflicts gracefully)
                         supabase.table(TARGET_TABLE_NAME).upsert(data, on_conflict='id').execute()
                     except Exception as e:
                         print(f"   !!! BATCH ERROR: {e}")
