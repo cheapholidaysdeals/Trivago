@@ -3,7 +3,7 @@ import sys
 import pandas as pd
 import requests
 import csv
-from io import BytesIO  # REQUIRED for handling binary/gzip data
+from io import BytesIO
 from supabase import create_client, Client
 
 def sync_data():
@@ -29,7 +29,6 @@ def sync_data():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept-Encoding': 'gzip'
         }
-        # We access .content (raw bytes) instead of .text
         response = requests.get(feed_url, headers=headers)
         response.raise_for_status()
         print(f"Download complete. Size: {len(response.content)} bytes")
@@ -40,22 +39,22 @@ def sync_data():
     # --- 3. PARSE DATA ---
     print("Parsing CSV data...")
     try:
-        # compression='gzip' decompresses the stream on the fly
-        # quoting=csv.QUOTE_NONE prevents "Buffer Overflow" errors from unescaped quotes in descriptions
+        # FIX: sep=',' because your error log showed comma-separated headers
+        # engine='python' is slower but more robust against "Buffer Overflow"
+        # on_bad_lines='skip' ensures the script doesn't crash if 1 row out of 200k is bad
         df = pd.read_csv(
             BytesIO(response.content), 
-            sep='\t', 
+            sep=',', 
             compression='gzip',
-            quoting=csv.QUOTE_NONE,
-            on_bad_lines='skip',
-            low_memory=False
+            engine='python', 
+            on_bad_lines='skip' 
         )
         
-        # Verify columns were parsed correctly
+        # Verify columns
         print(f"Columns detected ({len(df.columns)}): {df.columns.tolist()[:3]} ...")
         
         if len(df.columns) < 2:
-            print("Error: Decompressed successfully but found < 2 columns. Separator might be wrong.")
+            print("Error: Parsed < 2 columns. Please check if the separator is actually '|' or ';'.")
             sys.exit(1)
 
     except Exception as e:
@@ -65,15 +64,15 @@ def sync_data():
     # --- 4. CLEAN DATA ---
     print("Cleaning data...")
     
-    # Supabase JSON cannot handle NaN. Replace with None.
+    # Replace NaN with None (JSON null)
     df = df.where(pd.notnull(df), None)
 
-    # Clean Column Names (remove whitespace)
+    # Clean Column Names
     df.columns = df.columns.str.strip()
 
-    # OPTIONAL: Handle numeric fields that might be empty strings
-    # If your DB expects a number but gets "", Supabase will error.
-    # Convert specific numeric columns if needed here.
+    # Fix Zipcodes (force to string)
+    if 'Travel:destination_zipcode' in df.columns:
+        df['Travel:destination_zipcode'] = df['Travel:destination_zipcode'].astype(str).replace('nan', None)
 
     # --- 5. UPLOAD TO SUPABASE ---
     records = df.to_dict(orient='records')
@@ -84,7 +83,7 @@ def sync_data():
         print("No records found.")
         sys.exit(0)
 
-    # Batching to avoid timeouts
+    # Batching (Use 1000 for speed, reduce to 500 if you get timeouts)
     batch_size = 1000
     table_name = "Trivago Hotels"
 
@@ -93,15 +92,15 @@ def sync_data():
     for i in range(0, total_records, batch_size):
         batch = records[i:i + batch_size]
         try:
-            # Upsert using Primary Key (likely 'aw_product_id')
             supabase.table(table_name).upsert(batch).execute()
             
-            # Print progress every 10 batches
+            # Log progress
             if (i // batch_size) % 10 == 0:
                 print(f"Batch {i // batch_size + 1} uploaded...")
                 
         except Exception as e:
             print(f"Error uploading batch at row {i}: {e}")
+            # If a batch fails, we exit so GitHub Action marks as failed
             sys.exit(1)
 
     print("Sync completed successfully.")
