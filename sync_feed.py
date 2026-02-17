@@ -1,107 +1,67 @@
 import os
-import requests
-import gzip
-import io
+import sys
 import pandas as pd
-import numpy as np
-from datetime import datetime, timezone
+import requests
+from io import StringIO
 from supabase import create_client, Client
 
-# --- CONFIGURATION ---
-TARGET_TABLE_NAME = "Trivago Hotels"
-BATCH_SIZE = 1000
-
-# LIST OF COLUMNS THAT MUST BE NUMBERS
-NUMERIC_COLS = [
-    "aw_product_id", 
-    "merchant_product_id", 
-    "search_price", 
-    "merchant_id", 
-    "data_feed_id", 
-    "rating", 
-    "Travel:hotel_stars", 
-    "Travel:longitude", 
-    "Travel:latitude", 
-    "Travel:destination_zipcode"
-]
-
-# Setup Connection
-url: str = os.environ.get("SUPABASE_URL")
-key: str = os.environ.get("SUPABASE_KEY")
-awin_url: str = os.environ.get("AWIN_FEED_URL")
-supabase: Client = create_client(url, key)
-
-def clean_numeric_column(df, col_name):
-    """Removes spaces and converts to number. Turns bad data into NULL."""
-    if col_name in df.columns:
-        df[col_name] = pd.to_numeric(
-            df[col_name].astype(str).str.replace(" ", ""), 
-            errors='coerce'
-        )
-    return df
-
 def sync_data():
-    print(f"--- STARTING SYNC FOR: {TARGET_TABLE_NAME} ---")
-    
-    # 1. Capture the start time
-    sync_start_time = datetime.now(timezone.utc).isoformat()
-    print(f"Timestamp for this run: {sync_start_time}")
+    # 1. Load Environment Variables
+    url: str = os.environ.get("SUPABASE_URL")
+    key: str = os.environ.get("SUPABASE_KEY")
+    feed_url: str = os.environ.get("AWIN_FEED_URL")
 
-    # --- NEW STEP: RPC TRUNCATE ---
-    print("1.5. Wiping table via SQL Function (Instant)...")
+    if not all([url, key, feed_url]):
+        print("Error: Missing environment variables.")
+        sys.exit(1)
+
+    supabase: Client = create_client(url, key)
+
+    # 2. Fetch and Parse CSV
+    print("Fetching CSV feed...")
     try:
-        # This calls the SQL function we created in Step 1
-        supabase.rpc("truncate_trivago_hotels").execute()
-        print("   Table truncated successfully.")
-    except Exception as e:
-        print(f"   !!! CRITICAL ERROR WIPING TABLE: {e}")
-        print("   Make sure you created the 'truncate_trivago_hotels' function in Supabase SQL Editor.")
-        exit(1)
-    # ------------------------------------
+        response = requests.get(feed_url)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"Failed to download feed: {e}")
+        sys.exit(1)
 
-    print("2. Downloading Data...")
-    response = requests.get(awin_url)
-    if response.status_code != 200:
-        print(f"Error: Download failed code {response.status_code}")
-        exit(1)
-
-    print("3. Processing & Cleaning Data...")
+    print("Parsing CSV data...")
     try:
-        with io.BytesIO(response.content) as compressed_file:
-            with gzip.open(compressed_file, 'rt', encoding='utf-8', errors='ignore') as f:
-                
-                # Read CSV in chunks
-                for chunk in pd.read_csv(f, chunksize=BATCH_SIZE, dtype=str):
-                    
-                    # A. MAP ID & TIMESTAMP
-                    if 'aw_product_id' in chunk.columns:
-                        chunk['id'] = chunk['aw_product_id']
-                    
-                    # Add the 'last_synced_at' column
-                    chunk['last_synced_at'] = sync_start_time
-                    
-                    # B. CLEAN NUMERIC COLUMNS
-                    for col in NUMERIC_COLS:
-                        chunk = clean_numeric_column(chunk, col)
-
-                    # C. HANDLE NULLS (NaN -> None)
-                    chunk = chunk.replace({np.nan: None})
-                    
-                    # D. UPLOAD
-                    data = chunk.to_dict(orient='records')
-                    
-                    print(f"   Inserting batch of {len(data)} rows...")
-                    try:
-                        # Since table is empty, we can just insert (upsert handles conflicts gracefully)
-                        supabase.table(TARGET_TABLE_NAME).upsert(data, on_conflict='id').execute()
-                    except Exception as e:
-                        print(f"   !!! BATCH ERROR: {e}")
-
+        # Use StringIO to handle the raw string content as a file
+        df = pd.read_csv(StringIO(response.text), sep=',') # Ensure sep matches your feed (comma or tab)
     except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
-        exit(1)
+        print(f"Failed to parse CSV: {e}")
+        sys.exit(1)
 
-    print("--- SYNC COMPLETE ---")
+    # 3. Clean Data for Supabase
+    # Supabase (JSON) cannot handle NaN/Info; replace with None
+    df = df.where(pd.notnull(df), None)
+
+    # OPTIONAL: Drop columns in the CSV that don't exist in your DB Schema
+    # to prevent "Column not found" errors.
+    # df = df[['aw_product_id', 'product_name', ... keep only valid columns ...]]
+
+    # 4. Upsert to Supabase in Batches
+    # Batching is crucial for large feeds to avoid timeouts or payload limits
+    batch_size = 1000
+    records = df.to_dict(orient='records')
+    total_records = len(records)
+    print(f"Processing {total_records} records...")
+
+    for i in range(0, total_records, batch_size):
+        batch = records[i:i + batch_size]
+        try:
+            # Assuming 'aw_product_id' is a unique identifier you can use for upserting
+            # If you want to just append, use .insert() instead of .upsert()
+            data = supabase.table("Trivago Hotels").upsert(batch).execute()
+            print(f"Batch {i // batch_size + 1} uploaded successfully.")
+        except Exception as e:
+            print(f"Error uploading batch starting at index {i}: {e}")
+            # IMPORTANT: Exit with error code so GitHub Action knows it failed
+            sys.exit(1)
+
+    print("Sync completed successfully.")
 
 if __name__ == "__main__":
     sync_data()
