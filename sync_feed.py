@@ -3,6 +3,7 @@ import sys
 import pandas as pd
 import requests
 import csv
+import numpy as np # Added for handling Infinity
 from io import BytesIO
 from supabase import create_client, Client
 
@@ -39,22 +40,18 @@ def sync_data():
     # --- 3. PARSE DATA ---
     print("Parsing CSV data...")
     try:
-        # FIX: sep=',' because your error log showed comma-separated headers
-        # engine='python' is slower but more robust against "Buffer Overflow"
-        # on_bad_lines='skip' ensures the script doesn't crash if 1 row out of 200k is bad
         df = pd.read_csv(
             BytesIO(response.content), 
-            sep=',', 
+            sep=',', # Comma separated
             compression='gzip',
             engine='python', 
             on_bad_lines='skip' 
         )
         
         # Verify columns
-        print(f"Columns detected ({len(df.columns)}): {df.columns.tolist()[:3]} ...")
-        
+        print(f"Columns detected ({len(df.columns)})")
         if len(df.columns) < 2:
-            print("Error: Parsed < 2 columns. Please check if the separator is actually '|' or ';'.")
+            print("Error: Parsed < 2 columns.")
             sys.exit(1)
 
     except Exception as e:
@@ -64,13 +61,17 @@ def sync_data():
     # --- 4. CLEAN DATA ---
     print("Cleaning data...")
     
-    # Replace NaN with None (JSON null)
+    # FIX: Replace Infinity values with NaN first
+    # (JSON supports 'null' but crashes on 'Infinity')
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # Then replace all NaN (including the ones we just made) with None
     df = df.where(pd.notnull(df), None)
 
     # Clean Column Names
     df.columns = df.columns.str.strip()
 
-    # Fix Zipcodes (force to string)
+    # Fix Zipcodes (force to string to prevent numeric errors on postal codes)
     if 'Travel:destination_zipcode' in df.columns:
         df['Travel:destination_zipcode'] = df['Travel:destination_zipcode'].astype(str).replace('nan', None)
 
@@ -83,7 +84,7 @@ def sync_data():
         print("No records found.")
         sys.exit(0)
 
-    # Batching (Use 1000 for speed, reduce to 500 if you get timeouts)
+    # Batching (1000 is standard, but if you get timeouts reduce to 500)
     batch_size = 1000
     table_name = "Trivago Hotels"
 
@@ -100,7 +101,6 @@ def sync_data():
                 
         except Exception as e:
             print(f"Error uploading batch at row {i}: {e}")
-            # If a batch fails, we exit so GitHub Action marks as failed
             sys.exit(1)
 
     print("Sync completed successfully.")
