@@ -3,7 +3,7 @@ import sys
 import pandas as pd
 import requests
 import csv
-from io import StringIO
+from io import BytesIO  # REQUIRED for handling binary/gzip data
 from supabase import create_client, Client
 
 def sync_data():
@@ -23,56 +23,57 @@ def sync_data():
         sys.exit(1)
 
     # --- 2. FETCH DATA ---
-    print("Fetching CSV feed...")
+    print("Fetching GZIP feed...")
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept-Encoding': 'gzip'
         }
+        # We access .content (raw bytes) instead of .text
         response = requests.get(feed_url, headers=headers)
         response.raise_for_status()
+        print(f"Download complete. Size: {len(response.content)} bytes")
     except requests.exceptions.RequestException as e:
         print(f"Failed to download feed: {e}")
         sys.exit(1)
 
-    # --- 3. PARSE DATA (ROBUST MODE) ---
+    # --- 3. PARSE DATA ---
     print("Parsing CSV data...")
     try:
-        # csv.QUOTE_NONE tells pandas: "Ignore all quotation marks, just split by tab."
-        # engine='python' is slower but prevents the "Buffer Overflow" C-engine error.
+        # compression='gzip' decompresses the stream on the fly
+        # quoting=csv.QUOTE_NONE prevents "Buffer Overflow" errors from unescaped quotes in descriptions
         df = pd.read_csv(
-            StringIO(response.text), 
+            BytesIO(response.content), 
             sep='\t', 
-            engine='python',
+            compression='gzip',
             quoting=csv.QUOTE_NONE,
-            on_bad_lines='skip'
+            on_bad_lines='skip',
+            low_memory=False
         )
         
-        # Check if we actually got data
-        if df.empty or len(df.columns) < 2:
-            print(f"Warning: Data parsed but looks wrong. Columns found: {len(df.columns)}")
-            print("First 500 chars of raw data for debugging:")
-            print(response.text[:500])
+        # Verify columns were parsed correctly
+        print(f"Columns detected ({len(df.columns)}): {df.columns.tolist()[:3]} ...")
+        
+        if len(df.columns) < 2:
+            print("Error: Decompressed successfully but found < 2 columns. Separator might be wrong.")
             sys.exit(1)
 
     except Exception as e:
         print(f"Failed to parse CSV: {e}")
-        # Print a snippet of the data to help debug if it fails again
-        print("--- RAW DATA SNIPPET ---")
-        print(response.text[:200]) 
         sys.exit(1)
 
     # --- 4. CLEAN DATA ---
     print("Cleaning data...")
     
-    # 1. Replace NaN with None (JSON null)
+    # Supabase JSON cannot handle NaN. Replace with None.
     df = df.where(pd.notnull(df), None)
 
-    # 2. Ensure column names match Supabase exactly (Strip whitespace)
+    # Clean Column Names (remove whitespace)
     df.columns = df.columns.str.strip()
 
-    # 3. Clean Zipcodes (Handle mixed types)
-    if 'Travel:destination_zipcode' in df.columns:
-        df['Travel:destination_zipcode'] = df['Travel:destination_zipcode'].astype(str).replace('nan', None)
+    # OPTIONAL: Handle numeric fields that might be empty strings
+    # If your DB expects a number but gets "", Supabase will error.
+    # Convert specific numeric columns if needed here.
 
     # --- 5. UPLOAD TO SUPABASE ---
     records = df.to_dict(orient='records')
@@ -83,25 +84,24 @@ def sync_data():
         print("No records found.")
         sys.exit(0)
 
-    # Batches of 500 are safer for large text fields
-    batch_size = 500
-    table_name = "Trivago Hotels" 
+    # Batching to avoid timeouts
+    batch_size = 1000
+    table_name = "Trivago Hotels"
 
-    print(f"Starting upload to table: {table_name}")
+    print(f"Starting upload to table: '{table_name}'")
     
     for i in range(0, total_records, batch_size):
         batch = records[i:i + batch_size]
         try:
-            # upsert requires a primary key to be defined in Supabase
+            # Upsert using Primary Key (likely 'aw_product_id')
             supabase.table(table_name).upsert(batch).execute()
             
-            # Print progress every 5 batches to avoid cluttering logs
-            if (i // batch_size) % 5 == 0:
-                print(f"Processed row {i}...")
+            # Print progress every 10 batches
+            if (i // batch_size) % 10 == 0:
+                print(f"Batch {i // batch_size + 1} uploaded...")
                 
         except Exception as e:
             print(f"Error uploading batch at row {i}: {e}")
-            # If one batch fails, we exit so you know about it
             sys.exit(1)
 
     print("Sync completed successfully.")
