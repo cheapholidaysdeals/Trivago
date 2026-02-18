@@ -2,10 +2,35 @@ import os
 import sys
 import pandas as pd
 import requests
-import csv
-import numpy as np # Added for handling Infinity
+import numpy as np
 from io import BytesIO
 from supabase import create_client, Client
+
+# --- CONFIGURATION ---
+BATCH_SIZE = 1000       # Rows to upload to Supabase at once
+CHUNK_SIZE = 5000       # Rows to read from CSV at once (saves memory)
+TABLE_NAME = "Trivago Hotels"
+UNIQUE_KEY = "aw_product_id" # The column used to identify unique rows
+
+def clean_dataframe(df):
+    """Cleans the dataframe to ensure compatibility with Supabase types."""
+    
+    # 1. Handle Infinite and NaN values (JSON standard)
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    
+    # 2. Force Zipcodes to strings first, then handle numeric constraint
+    # Note: Your DB has zip_code as 'numeric', but zipcodes can have letters (e.g. UK/Canada).
+    # If the DB field is strictly numeric, we must force invalid zips to None to prevent crashes.
+    if 'Travel:destination_zipcode' in df.columns:
+        df['Travel:destination_zipcode'] = pd.to_numeric(df['Travel:destination_zipcode'], errors='coerce')
+
+    # 3. Replace all NaNs with None (which becomes NULL in SQL)
+    df = df.where(pd.notnull(df), None)
+    
+    # 4. Strip whitespace from column headers
+    df.columns = df.columns.str.strip()
+    
+    return df
 
 def sync_data():
     # --- 1. SETUP ---
@@ -23,85 +48,55 @@ def sync_data():
         print(f"Error initializing Supabase: {e}")
         sys.exit(1)
 
-    # --- 2. FETCH DATA ---
-    print("Fetching GZIP feed...")
+    # --- 2. FETCH & PROCESS DATA (STREAMING) ---
+    print("Starting download and sync...")
+    
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept-Encoding': 'gzip'
-        }
-        response = requests.get(feed_url, headers=headers)
-        response.raise_for_status()
-        print(f"Download complete. Size: {len(response.content)} bytes")
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to download feed: {e}")
-        sys.exit(1)
+        # Stream the download to avoid loading 500MB+ into RAM
+        with requests.get(feed_url, headers={'Accept-Encoding': 'gzip'}, stream=True) as response:
+            response.raise_for_status()
+            
+            # Use chunks to process the file piece by piece
+            # This prevents "Out of Memory" errors on GitHub Actions
+            reader = pd.read_csv(
+                response.raw, # Read directly from the stream
+                sep=',',
+                compression='gzip',
+                chunksize=CHUNK_SIZE,
+                low_memory=False,
+                on_bad_lines='skip'
+            )
 
-    # --- 3. PARSE DATA ---
-    print("Parsing CSV data...")
-    try:
-        df = pd.read_csv(
-            BytesIO(response.content), 
-            sep=',', # Comma separated
-            compression='gzip',
-            engine='python', 
-            on_bad_lines='skip' 
-        )
-        
-        # Verify columns
-        print(f"Columns detected ({len(df.columns)})")
-        if len(df.columns) < 2:
-            print("Error: Parsed < 2 columns.")
-            sys.exit(1)
+            total_uploaded = 0
+            
+            for chunk_idx, df in enumerate(reader):
+                print(f"Processing chunk {chunk_idx + 1} ({len(df)} rows)...")
+                
+                # Clean the chunk
+                df_clean = clean_dataframe(df)
+                
+                # Convert to records
+                records = df_clean.to_dict(orient='records')
+                
+                # Upload in smaller batches
+                for i in range(0, len(records), BATCH_SIZE):
+                    batch = records[i:i + BATCH_SIZE]
+                    try:
+                        # CRITICAL: on_conflict arg ensures we UPDATE existing rows instead of inserting duplicates
+                        supabase.table(TABLE_NAME).upsert(
+                            batch, 
+                            on_conflict=UNIQUE_KEY
+                        ).execute()
+                    except Exception as e:
+                        print(f"Error uploading batch in chunk {chunk_idx}: {e}")
+                        # Optional: Don't exit, just log error so other batches continue
+                
+                total_uploaded += len(records)
+                print(f"Total rows synced so far: {total_uploaded}")
 
     except Exception as e:
-        print(f"Failed to parse CSV: {e}")
+        print(f"Critical Error during sync: {e}")
         sys.exit(1)
-
-    # --- 4. CLEAN DATA ---
-    print("Cleaning data...")
-    
-    # FIX: Replace Infinity values with NaN first
-    # (JSON supports 'null' but crashes on 'Infinity')
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-    # Then replace all NaN (including the ones we just made) with None
-    df = df.where(pd.notnull(df), None)
-
-    # Clean Column Names
-    df.columns = df.columns.str.strip()
-
-    # Fix Zipcodes (force to string to prevent numeric errors on postal codes)
-    if 'Travel:destination_zipcode' in df.columns:
-        df['Travel:destination_zipcode'] = df['Travel:destination_zipcode'].astype(str).replace('nan', None)
-
-    # --- 5. UPLOAD TO SUPABASE ---
-    records = df.to_dict(orient='records')
-    total_records = len(records)
-    print(f"Prepared {total_records} records.")
-
-    if total_records == 0:
-        print("No records found.")
-        sys.exit(0)
-
-    # Batching (1000 is standard, but if you get timeouts reduce to 500)
-    batch_size = 1000
-    table_name = "Trivago Hotels"
-
-    print(f"Starting upload to table: '{table_name}'")
-    
-    for i in range(0, total_records, batch_size):
-        batch = records[i:i + batch_size]
-        try:
-            supabase.table(table_name).upsert(batch).execute()
-            
-            # Log progress
-            if (i // batch_size) % 10 == 0:
-                print(f"Batch {i // batch_size + 1} uploaded...")
-                
-        except Exception as e:
-            print(f"Error uploading batch at row {i}: {e}")
-            sys.exit(1)
 
     print("Sync completed successfully.")
 
