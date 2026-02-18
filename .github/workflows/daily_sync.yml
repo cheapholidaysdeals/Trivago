@@ -4,11 +4,12 @@ on:
   schedule:
     # Runs at 03:00 UTC daily
     - cron: '0 3 * * *'
-  workflow_dispatch: # Allows you to run this manually for testing
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # Stop job if it hangs for more than an hour
     
     steps:
       - name: Check out code
@@ -17,11 +18,11 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          pip install requests pandas supabase
+          pip install requests pandas supabase numpy
 
       - name: Run Sync Script
         env:
