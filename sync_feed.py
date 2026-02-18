@@ -13,23 +13,25 @@ TABLE_NAME = "Trivago Hotels"
 UNIQUE_KEY = "aw_product_id" 
 
 def clean_dataframe(df):
-    """Cleans the dataframe to ensure compatibility with Supabase types."""
+    """
+    Aggressively cleans the dataframe to ensure JSON compliance.
+    """
     
-    # 1. Handle Infinite and NaN values
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    
-    # 2. Force Zipcodes to strings/numeric safely
+    # 1. Handle Zipcodes: Force errors to NaN
+    # (If the CSV has "SW1A" but DB expects Numeric, this prevents a crash by making it Null)
     if 'Travel:destination_zipcode' in df.columns:
-        # Force to numeric, turn errors (letters) into NaN
         df['Travel:destination_zipcode'] = pd.to_numeric(df['Travel:destination_zipcode'], errors='coerce')
 
-    # 3. Replace all NaNs with None (SQL NULL)
-    df = df.where(pd.notnull(df), None)
+    # 2. Replace Infinity with NaN
+    # JSON cannot handle 'Infinity', so we turn it into 'NaN' first
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    # 3. THE FIX: Cast to Object and Replace NaN with None
+    # Pandas Float columns usually refuse to hold 'None'. 
+    # By casting to 'object' first, we allow 'None' (which sends as SQL NULL) to exist.
+    df_clean = df.astype(object).where(pd.notnull(df), None)
     
-    # 4. Strip whitespace from column headers
-    df.columns = df.columns.str.strip()
-    
-    return df
+    return df_clean
 
 def sync_data():
     print("--- STARTING SYNC ---")
@@ -56,7 +58,6 @@ def sync_data():
         with requests.get(feed_url, headers={'Accept-Encoding': 'gzip'}, stream=True) as response:
             if response.status_code != 200:
                 print(f"CRITICAL ERROR: Feed URL returned status code {response.status_code}")
-                print(f"Response: {response.text[:200]}") # Print first 200 chars of error
                 sys.exit(1)
 
             print("Download connection established. Processing chunks...")
@@ -77,25 +78,24 @@ def sync_data():
             for chunk_idx, df in enumerate(reader):
                 print(f"--- Processing Chunk {chunk_idx + 1} (Rows: {len(df)}) ---")
                 
-                # DEBUG: Print first row keys to verify column mapping matches DB
-                if chunk_idx == 0:
-                    print(f"Detected Columns: {list(df.columns)}")
-
+                # Clean the data
                 df_clean = clean_dataframe(df)
+                
+                # Convert to records
                 records = df_clean.to_dict(orient='records')
                 
                 for i in range(0, len(records), BATCH_SIZE):
                     batch = records[i:i + BATCH_SIZE]
                     try:
                         # Perform Upsert
-                        data = supabase.table(TABLE_NAME).upsert(
+                        supabase.table(TABLE_NAME).upsert(
                             batch, 
                             on_conflict=UNIQUE_KEY
                         ).execute()
                         
-                        # Check if Supabase returned data (successful write)
-                        # Note: Depending on library version, data might be in data.data or just data
-                        print(f"   > Batch {i//BATCH_SIZE + 1}: Success.")
+                        # Log success sparingly to save log space
+                        if i == 0:
+                            print(f"   > Batch {i//BATCH_SIZE + 1}: Success (Sample).")
                         
                     except Exception as e:
                         print(f"   > ERROR uploading batch {i}: {e}")
@@ -104,12 +104,8 @@ def sync_data():
                 total_uploaded += len(records)
                 print(f"Total rows processed: {total_uploaded}")
 
-            if total_uploaded == 0:
-                print("WARNING: Script finished but 0 rows were found in the CSV.")
-            
             if has_errors:
                  print("Script finished with some batch errors. Check logs above.")
-                 # exit with error so GitHub knows something went wrong
                  sys.exit(1)
 
     except Exception as e:
