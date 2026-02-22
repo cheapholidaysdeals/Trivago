@@ -9,7 +9,7 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # Stop job if it hangs for more than an hour
+    timeout-minutes: 120  # Stop job if it hangs for more than two hours
     
     steps:
       - name: Check out code
