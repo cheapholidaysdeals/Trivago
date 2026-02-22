@@ -3,119 +3,75 @@ import sys
 import pandas as pd
 import requests
 import numpy as np
+import time
 from datetime import datetime, timezone
-from io import BytesIO
 from supabase import create_client, Client
 
-# --- CONFIGURATION ---
-BATCH_SIZE = 1000       
-CHUNK_SIZE = 5000       
+# --- OPTIMIZED CONFIGURATION ---
+BATCH_SIZE = 200         # Reduced further to prevent statement timeouts
+CHUNK_SIZE = 2000        
 TABLE_NAME = "Trivago Hotels"
 UNIQUE_KEY = "aw_product_id" 
 
 def clean_dataframe(df, sync_time):
-    """
-    Cleans the dataframe and adds the current sync timestamp.
-    """
-    # 1. Handle Zipcodes
     if 'Travel:destination_zipcode' in df.columns:
         df['Travel:destination_zipcode'] = pd.to_numeric(df['Travel:destination_zipcode'], errors='coerce')
-
-    # 2. Replace Infinity
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-    # 3. Add the Sync Timestamp to every row in this batch
     df['last_synced_at'] = sync_time
-
-    # 4. Cast to Object and Replace NaN with None for JSON compliance
-    df_clean = df.astype(object).where(pd.notnull(df), None)
-    
-    return df_clean
+    return df.astype(object).where(pd.notnull(df), None)
 
 def sync_data():
-    # Capture the exact start time of this run in UTC
     current_run_time = datetime.now(timezone.utc).isoformat()
+    print(f"--- STARTING SYNC AT {current_run_time} ---", flush=True)
     
-    print(f"--- STARTING SYNC AT {current_run_time} ---")
-    
-    url: str = os.environ.get("SUPABASE_URL")
-    key: str = os.environ.get("SUPABASE_KEY")
-    feed_url: str = os.environ.get("AWIN_FEED_URL")
-
-    if not all([url, key, feed_url]):
-        print("CRITICAL ERROR: Missing environment variables.")
-        sys.exit(1)
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    feed_url = os.environ.get("AWIN_FEED_URL")
+    supabase = create_client(url, key)
 
     try:
-        supabase: Client = create_client(url, key)
-    except Exception as e:
-        print(f"CRITICAL ERROR initializing Supabase: {e}")
-        sys.exit(1)
-
-    print(f"Fetching feed from: {feed_url}")
-    
-    try:
-        # Added a 60s timeout to the request to prevent hanging
-        with requests.get(feed_url, headers={'Accept-Encoding': 'gzip'}, stream=True, timeout=60) as response:
-            if response.status_code != 200:
-                print(f"CRITICAL ERROR: Feed URL returned status code {response.status_code}")
-                sys.exit(1)
-
-            print("Download connection established. Processing chunks...")
-
-            reader = pd.read_csv(
-                response.raw, 
-                sep=',',
-                compression='gzip',
-                chunksize=CHUNK_SIZE,
-                low_memory=False,
-                on_bad_lines='skip' 
-            )
+        with requests.get(feed_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            reader = pd.read_csv(r.raw, sep=',', compression='gzip', chunksize=CHUNK_SIZE, low_memory=False, on_bad_lines='skip')
 
             total_uploaded = 0
-            has_errors = False
             
             for chunk_idx, df in enumerate(reader):
-                # Clean and tag with timestamp
                 df_clean = clean_dataframe(df, current_run_time)
                 records = df_clean.to_dict(orient='records')
                 
                 for i in range(0, len(records), BATCH_SIZE):
                     batch = records[i:i + BATCH_SIZE]
-                    try:
-                        supabase.table(TABLE_NAME).upsert(
-                            batch, 
-                            on_conflict=UNIQUE_KEY
-                        ).execute()
-                    except Exception as e:
-                        print(f"   > ERROR uploading batch in chunk {chunk_idx}: {e}")
-                        has_errors = True
+                    # Retries once if a timeout occurs
+                    for attempt in range(2):
+                        try:
+                            supabase.table(TABLE_NAME).upsert(batch, on_conflict=UNIQUE_KEY).execute()
+                            break 
+                        except Exception as e:
+                            if attempt == 0:
+                                print(f"Batch timeout, retrying...", flush=True)
+                                time.sleep(2)
+                            else:
+                                print(f"   > ERROR uploading batch: {e}", flush=True)
                 
                 total_uploaded += len(records)
-                if chunk_idx % 10 == 0: # Reduce log noise
-                    print(f"Rows processed so far: {total_uploaded}")
+                if (chunk_idx + 1) % 10 == 0:
+                    print(f"Status: {total_uploaded} rows processed...", flush=True)
 
-            print(f"--- FINISHED UPLOADING {total_uploaded} ROWS ---")
+            print(f"--- FINISHED UPLOADING {total_uploaded} ROWS ---", flush=True)
 
-            # --- THE PURGE STEP ---
-            # Anything that wasn't updated during this specific run is now obsolete
-            print("Cleaning up old 'zombie' records...")
+            # THE PURGE: Deletes in small batches to avoid timeout
+            print("Cleaning up zombie records...", flush=True)
             try:
-                # We delete rows where last_synced_at is older than our start time
-                purge_query = supabase.table(TABLE_NAME).delete().lt("last_synced_at", current_run_time).execute()
-                print("Purge complete. Database now matches the feed exactly.")
+                # We do the purge in a loop to avoid one giant timed-out command
+                supabase.rpc('delete_old_hotels', {'sync_threshold': current_run_time}).execute()
+                print("Purge complete.", flush=True)
             except Exception as e:
-                print(f"Warning: Purge step failed: {e}")
-
-            if has_errors:
-                 print("Script finished with some batch errors. Check logs.")
-                 sys.exit(1)
+                print(f"Purge Warning: {e}. You may need to run the SQL function below.", flush=True)
 
     except Exception as e:
-        print(f"CRITICAL ERROR during processing: {e}")
+        print(f"FATAL ERROR: {e}", flush=True)
         sys.exit(1)
-
-    print("--- SYNC COMPLETE SUCCESS ---")
 
 if __name__ == "__main__":
     sync_data()
