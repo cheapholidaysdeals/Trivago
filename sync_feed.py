@@ -29,10 +29,15 @@ def run_sync():
     print("Processing CSV data into memory...", flush=True)
     try:
         df = pd.read_csv("trivago_raw.csv.gz", compression='gzip', low_memory=False, on_bad_lines='skip')
+        
+        # Clean numeric data
         if 'Travel:destination_zipcode' in df.columns:
             df['Travel:destination_zipcode'] = pd.to_numeric(df['Travel:destination_zipcode'], errors='coerce')
+        
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df = df.where(pd.notnull(df), None)
+
+        # Remove columns that shouldn't be in the bulk import
         cols_to_drop = ['last_synced_at', 'id']
         for col in cols_to_drop:
             if col in df.columns:
@@ -46,15 +51,20 @@ def run_sync():
         print(f"FATAL ERROR processing CSV: {e}", flush=True)
         sys.exit(1)
 
-    # 3. Connect
+    # 3. Connect with Keep-Alive settings
     print("Connecting directly to PostgreSQL...", flush=True)
     try:
-        conn = psycopg2.connect(db_url)
-        conn.autocommit = False 
+        # Adding keepalives to prevent SSL timeout
+        conn = psycopg2.connect(
+            db_url, 
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
+        conn.autocommit = True # Switch to autocommit to avoid long-running transaction blocks
         cursor = conn.cursor()
-        
-        # INCREASE TIMEOUT TO 10 MINUTES
-        cursor.execute("SET statement_timeout = '10min';")
+        cursor.execute("SET statement_timeout = '15min';")
     except Exception as e:
          print(f"FATAL ERROR connecting to database: {e}", flush=True)
          sys.exit(1)
@@ -71,17 +81,21 @@ def run_sync():
         copy_sql = f"COPY \"trivago_staging\" ({col_string}) FROM STDIN WITH (FORMAT CSV, DELIMITER '\t', NULL '')"
         cursor.copy_expert(copy_sql, csv_buffer)
 
-        # Step C: The Zero-Downtime Swap
-        print("Swapping staging data into live 'Trivago Hotels' table (this may take 2-3 mins)...", flush=True)
-        cursor.execute('TRUNCATE TABLE "Trivago Hotels" RESTART IDENTITY;')
-        cursor.execute(f'INSERT INTO "Trivago Hotels" ({col_string}) SELECT {col_string} FROM "trivago_staging";')
+        # Step C: Fast Swap
+        print("Swapping staging data into live 'Trivago Hotels' table...", flush=True)
+        # We do this in one block but since autocommit is True, it executes immediately
+        cursor.execute(f"""
+            BEGIN;
+            TRUNCATE TABLE "Trivago Hotels" RESTART IDENTITY;
+            INSERT INTO "Trivago Hotels" ({col_string}) 
+            SELECT {col_string} FROM "trivago_staging";
+            COMMIT;
+        """)
         
-        conn.commit()
-        print(f"--- SUCCESS: {len(df)} ROWS UPDATED WITH ZERO DOWNTIME ---", flush=True)
+        print(f"--- SUCCESS: {len(df)} ROWS UPDATED ---", flush=True)
 
     except Exception as e:
-        conn.rollback()
-        print(f"❌ DATABASE TRANSACTION FAILED: {e}", flush=True)
+        print(f"❌ DATABASE ERROR: {e}", flush=True)
         sys.exit(1)
         
     finally:
