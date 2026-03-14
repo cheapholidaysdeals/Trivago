@@ -67,28 +67,24 @@ def run_sync():
         print("Emptying 'trivago_staging' table...", flush=True)
         cursor.execute('TRUNCATE TABLE "trivago_staging" RESTART IDENTITY;')
 
-        # Step B: Bulk copy - Explicitly naming columns to avoid ID conflicts
+        # Step B: Bulk copy - FIXED QUOTING HERE
         print(f"Bulk copying {len(df)} rows into staging...", flush=True)
+        # Ensure every column name is wrapped in double quotes
         columns = [f'"{c}"' for c in df.columns]
         col_string = ', '.join(columns)
         
-        copy_sql = f'COPY "trivago_staging" ({col_string}) FROM STDIN WITH (FORMAT CSV, DELIMITER "\t", NULL "")'
+        # Use single quotes for the delimiter and null string
+        copy_sql = f'COPY "trivago_staging" ({col_string}) FROM STDIN WITH (FORMAT CSV, DELIMITER \'\t\', NULL \'\')'
         cursor.copy_expert(copy_sql, csv_buffer)
 
         # Step C: The Zero-Downtime Swap
-        # Note: We list columns specifically in the INSERT to ensure 'id' is auto-generated
         print("Swapping staging data into live 'Trivago Hotels' table...", flush=True)
         
-        swap_query = f"""
-            BEGIN;
-            TRUNCATE TABLE "Trivago Hotels" RESTART IDENTITY;
-            INSERT INTO "Trivago Hotels" ({col_string}) 
-            SELECT {col_string} FROM "trivago_staging";
-            COMMIT;
-        """
-        cursor.execute(swap_query)
-        conn.commit()
+        # We perform the swap inside the same transaction
+        cursor.execute(f'TRUNCATE TABLE "Trivago Hotels" RESTART IDENTITY;')
+        cursor.execute(f'INSERT INTO "Trivago Hotels" ({col_string}) SELECT {col_string} FROM "trivago_staging";')
         
+        conn.commit()
         print(f"--- SUCCESS: {len(df)} ROWS UPDATED WITH ZERO DOWNTIME ---", flush=True)
 
     except Exception as e:
