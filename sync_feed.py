@@ -30,19 +30,20 @@ def run_sync():
     try:
         df = pd.read_csv("trivago_raw.csv.gz", compression='gzip', low_memory=False, on_bad_lines='skip')
         
-        # Apply your specific data cleaning rules
+        # Clean numeric data
         if 'Travel:destination_zipcode' in df.columns:
             df['Travel:destination_zipcode'] = pd.to_numeric(df['Travel:destination_zipcode'], errors='coerce')
         
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df = df.where(pd.notnull(df), None)
 
-        # Drop the last_synced_at column if it exists in your schema, 
-        # as the whole table is refreshed daily now anyway.
-        if 'last_synced_at' in df.columns:
-             df = df.drop(columns=['last_synced_at'])
+        # Remove columns that shouldn't be in the bulk import
+        cols_to_drop = ['last_synced_at', 'id']
+        for col in cols_to_drop:
+            if col in df.columns:
+                 df = df.drop(columns=[col])
 
-        # Save the cleaned data to an in-memory CSV buffer for the COPY command
+        # Save the cleaned data to an in-memory CSV buffer
         print("Formatting data for Postgres COPY...", flush=True)
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False, header=False, sep='\t')
@@ -51,11 +52,11 @@ def run_sync():
         print(f"FATAL ERROR processing CSV: {e}", flush=True)
         sys.exit(1)
 
-    # 3. Connect directly to PostgreSQL for the Swap
+    # 3. Connect directly to PostgreSQL
     print("Connecting directly to PostgreSQL...", flush=True)
     try:
         conn = psycopg2.connect(db_url)
-        conn.autocommit = False # Handled manually to ensure zero-downtime
+        conn.autocommit = False 
         cursor = conn.cursor()
     except Exception as e:
          print(f"FATAL ERROR connecting to database: {e}", flush=True)
@@ -64,26 +65,28 @@ def run_sync():
     try:
         # Step A: Empty the staging table
         print("Emptying 'trivago_staging' table...", flush=True)
-        cursor.execute('TRUNCATE TABLE "trivago_staging";')
+        cursor.execute('TRUNCATE TABLE "trivago_staging" RESTART IDENTITY;')
 
-        # Step B: Bulk copy the data into the staging table (Extremely fast)
+        # Step B: Bulk copy - Explicitly naming columns to avoid ID conflicts
         print(f"Bulk copying {len(df)} rows into staging...", flush=True)
-        columns = tuple(df.columns)
-        copy_sql = f"""
-            COPY "trivago_staging" ({','.join([f'"{c}"' for c in columns])}) 
-            FROM STDIN WITH (FORMAT CSV, DELIMITER '\t', NULL '')
-        """
+        columns = [f'"{c}"' for c in df.columns]
+        col_string = ', '.join(columns)
+        
+        copy_sql = f'COPY "trivago_staging" ({col_string}) FROM STDIN WITH (FORMAT CSV, DELIMITER "\t", NULL "")'
         cursor.copy_expert(copy_sql, csv_buffer)
 
         # Step C: The Zero-Downtime Swap
+        # Note: We list columns specifically in the INSERT to ensure 'id' is auto-generated
         print("Swapping staging data into live 'Trivago Hotels' table...", flush=True)
-        swap_sql = """
+        
+        swap_query = f"""
             BEGIN;
-            TRUNCATE TABLE "Trivago Hotels";
-            INSERT INTO "Trivago Hotels" SELECT * FROM "trivago_staging";
+            TRUNCATE TABLE "Trivago Hotels" RESTART IDENTITY;
+            INSERT INTO "Trivago Hotels" ({col_string}) 
+            SELECT {col_string} FROM "trivago_staging";
             COMMIT;
         """
-        cursor.execute(swap_sql)
+        cursor.execute(swap_query)
         conn.commit()
         
         print(f"--- SUCCESS: {len(df)} ROWS UPDATED WITH ZERO DOWNTIME ---", flush=True)
