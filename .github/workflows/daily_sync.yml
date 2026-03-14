@@ -22,11 +22,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests pandas supabase numpy
+          pip install requests pandas supabase numpy psycopg2-binary
 
       - name: Run Sync Script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           AWIN_FEED_URL: ${{ secrets.AWIN_FEED_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python sync_feed.py
